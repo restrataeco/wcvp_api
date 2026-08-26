@@ -1,21 +1,27 @@
 """
 WCVP / POWO CSV-backed API
 --------------------------
-Serves a large CSV (e.g. wcvp_names.csv) as a searchable, paginated REST API
-with no database.
+Serves a large CSV (e.g. wcvp_names.csv) as a searchable, paginated REST API,
+backed by a local SQLite file built from the CSV — not an in-memory
+dataframe, and not a re-scan of the CSV on every request.
 
-Two ways to supply the data:
-  1. Local file only: leave CSV_SOURCE_URL blank in .env, put the CSV at
-     CSV_PATH on disk yourself (e.g. via scp on Hetzner).
-  2. Public URL: set CSV_SOURCE_URL to a direct-download HTTPS link. On every
-     startup and every POST /reload, the app downloads that URL to CSV_PATH
-     and loads it from there. This is what makes it work on platforms with
-     ephemeral/reset filesystems (e.g. Render without a persistent disk).
+Startup flow:
+  1. If CSV_SOURCE_URL is set and no local CSV exists yet (or FORCE_DOWNLOAD
+     is true): download it. Otherwise use whatever CSV is already at CSV_PATH.
+  2. If no SQLite DB exists yet at DB_PATH (or FORCE_REBUILD is true): build
+     one from the CSV, with indexes on the configured columns. Otherwise skip
+     straight to serving — a plain restart does NOT re-download or rebuild.
+  3. POST /reload always does both steps, regardless of the flags above —
+     that's the explicit "refresh now" trigger.
+
+Once built, every request queries the SQLite file directly with indexed SQL —
+fast, low memory, and gives back exact total counts (no more "total: null").
 """
 
 import logging
-import math
 import os
+import re
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -32,11 +38,10 @@ logger = logging.getLogger("wcvp_api")
 
 app = FastAPI(
     title="WCVP Data API",
-    description="Read-only API over a POWO/WCVP CSV export.",
-    version="1.0.0",
+    description="Read-only API over a POWO/WCVP CSV export, backed by SQLite.",
+    version="3.0.0",
 )
 
-# Adjust origins for production if this is called from a browser frontend.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,13 +49,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- In-memory data store -----------------------------------------------
-# Guarded by a lock so a /reload can't race with an in-flight request reading
-# a half-swapped dataframe reference. Loading is fast (seconds) even at ~300MB.
-_data_lock = threading.RLock()
-_state = {"df": None, "columns": [], "row_count": 0}
-_last_loaded_at: Optional[datetime] = None
+_build_lock = threading.Lock()
+_last_ready_at: Optional[datetime] = None
+_columns: list = []
 
+TABLE = "records"
+IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")  # guards against SQL injection via column names
+
+
+def _valid_identifier(name: str) -> bool:
+    return bool(IDENTIFIER_RE.match(name))
+
+
+def _escape_like(value: str) -> str:
+    """Escape % _ and \\ so user input can't inject LIKE wildcards."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# --- Download ---------------------------------------------------------------
 
 def download_csv_from_url() -> None:
     """
@@ -76,62 +92,153 @@ def download_csv_from_url() -> None:
         with requests.get(settings.csv_source_url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):  # 8MB chunks
                     if chunk:
                         f.write(chunk)
 
     os.replace(tmp_path, settings.csv_path)  # atomic on same filesystem
     logger.info(f"Downloaded to {settings.csv_path}")
 
-def load_dataframe() -> pd.DataFrame:
-    logger.info(f"Loading CSV from {settings.csv_path} ...")
-    df = pd.read_csv(
-        settings.csv_path,
-        delimiter=settings.csv_delimiter,
-        dtype=str,          # keep everything as text; avoids pandas guessing types
-                             # inconsistently across a huge file. Cast per-field later if needed.
-        keep_default_na=False,
-        low_memory=False,
-    )
-    df.reset_index(drop=True, inplace=True)
-    df["_row_id"] = df.index  # stable id used for GET /records/{id}
-    logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns.")
-    logger.info(f"Columns: {list(df.columns)}")
-    return df
+
+# --- SQLite build -------------------------------------------------------
+
+def build_sqlite_from_csv() -> None:
+    """
+    Reads the CSV in chunks (bounded memory) and writes it into a fresh
+    SQLite file, then builds indexes. Builds into a .building temp file and
+    atomically renames into place at the end, so any request hitting the
+    real DB_PATH mid-build still sees the last good, fully-built database.
+    """
+    os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
+    tmp_db_path = settings.db_path + ".building"
+    if os.path.exists(tmp_db_path):
+        os.remove(tmp_db_path)
+
+    logger.info(f"Building SQLite DB from {settings.csv_path} ...")
+    conn = sqlite3.connect(tmp_db_path)
+    try:
+        offset = 0
+        first_chunk = True
+        reader = pd.read_csv(
+            settings.csv_path,
+            delimiter=settings.csv_delimiter,
+            dtype=str,
+            keep_default_na=False,
+            low_memory=False,
+            chunksize=settings.build_chunk_size,
+        )
+        for chunk in reader:
+            chunk = chunk.reset_index(drop=True)
+            chunk.insert(0, "_row_id", range(offset, offset + len(chunk)))
+            chunk.to_sql(
+                TABLE, conn,
+                if_exists="replace" if first_chunk else "append",
+                index=False,
+            )
+            offset += len(chunk)
+            first_chunk = False
+            logger.info(f"  ...inserted {offset:,} rows so far")
+
+        if first_chunk:
+            raise ValueError("CSV appears to be empty — no rows were read.")
+
+        cur = conn.cursor()
+        cur.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS idx__row_id ON {TABLE}("_row_id")')
+
+        index_cols = [c.strip() for c in settings.index_columns.split(",") if c.strip()] \
+            or [c.strip() for c in settings.default_search_columns.split(",") if c.strip()]
+        cur.execute(f"PRAGMA table_info({TABLE})")
+        actual_cols = {row[1] for row in cur.fetchall()}
+        for col in index_cols:
+            if col not in actual_cols or not _valid_identifier(col):
+                logger.warning(f"Skipping index on unknown/invalid column: {col}")
+                continue
+            logger.info(f"  ...building index on {col}")
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_{col} ON {TABLE}("{col}")')
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    os.replace(tmp_db_path, settings.db_path)  # atomic swap
+    logger.info(f"SQLite DB ready at {settings.db_path} ({offset:,} rows).")
 
 
-def refresh_data():
-    """Full refresh cycle: download from URL if configured, then load into memory."""
-    global _last_loaded_at
-    if settings.csv_source_url:
-        download_csv_from_url()
-    df = load_dataframe()
-    _state["df"] = df
-    _state["columns"] = [c for c in df.columns if c != "_row_id"]
-    _state["row_count"] = len(df)
-    _last_loaded_at = datetime.now(timezone.utc)
+def read_columns_from_db() -> list:
+    conn = sqlite3.connect(settings.db_path)
+    try:
+        cur = conn.execute(f"PRAGMA table_info({TABLE})")
+        return [row[1] for row in cur.fetchall() if row[1] != "_row_id"]
+    finally:
+        conn.close()
+
+
+# --- Startup / refresh orchestration ----------------------------------------
+
+def ensure_data_ready(force_download: bool = False, force_rebuild: bool = False) -> None:
+    """
+    Core readiness flow, shared by startup and /reload.
+    - Downloads only if needed (missing file) or explicitly forced.
+    - Rebuilds SQLite only if needed (missing DB) or explicitly forced.
+    A plain process restart with an existing CSV + existing DB does neither —
+    it just starts serving immediately.
+    """
+    global _last_ready_at, _columns
+
+    with _build_lock:
+        need_download = (
+            settings.csv_source_url
+            and (force_download or settings.force_download or not os.path.exists(settings.csv_path))
+        )
+        if need_download:
+            download_csv_from_url()
+        elif not os.path.exists(settings.csv_path):
+            raise FileNotFoundError(
+                f"No file at {settings.csv_path} and no CSV_SOURCE_URL configured to fetch one."
+            )
+        else:
+            logger.info(f"Using existing CSV at {settings.csv_path} (no download needed).")
+
+        need_rebuild = force_rebuild or settings.force_rebuild or not os.path.exists(settings.db_path)
+        if need_rebuild:
+            build_sqlite_from_csv()
+        else:
+            logger.info(f"Using existing SQLite DB at {settings.db_path} (no rebuild needed).")
+
+        _columns = read_columns_from_db()
+        _last_ready_at = datetime.now(timezone.utc)
 
 
 @app.on_event("startup")
 def startup_event():
-    with _data_lock:
-        refresh_data()
+    ensure_data_ready()
 
 
-def get_df() -> pd.DataFrame:
-    if _state["df"] is None:
-        raise HTTPException(status_code=503, detail="Data not loaded yet.")
-    return _state["df"]
+def get_connection() -> sqlite3.Connection:
+    if not os.path.exists(settings.db_path):
+        raise HTTPException(status_code=503, detail="Database not ready yet.")
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 # --- Endpoints ------------------------------------------------------------
 
 @app.get("/health")
 def health():
+    db_size_mb = round(os.path.getsize(settings.db_path) / (1024 * 1024), 1) if os.path.exists(settings.db_path) else None
+    row_count = None
+    if os.path.exists(settings.db_path):
+        conn = get_connection()
+        try:
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+        finally:
+            conn.close()
     return {
         "status": "ok",
-        "rows_loaded": _state["row_count"],
-        "loaded_at": _last_loaded_at.isoformat() if _last_loaded_at else None,
+        "db_size_mb": db_size_mb,
+        "row_count": row_count,
+        "ready_at": _last_ready_at.isoformat() if _last_ready_at else None,
         "source": "url" if settings.csv_source_url else "local",
     }
 
@@ -139,42 +246,41 @@ def health():
 @app.get("/columns")
 def columns():
     """Inspect actual column names from your CSV — use these in ?columns= and filters."""
-    return {"columns": _state["columns"]}
+    return {"columns": _columns}
 
 
 @app.post("/reload")
 def reload_data(x_reload_token: Optional[str] = Header(None)):
     """
-    Reload the data without restarting the process.
-    - If CSV_SOURCE_URL is set: re-downloads from that URL, then reloads.
-    - Otherwise: re-reads csv_path directly off local disk (replace the file
-      at CSV_PATH yourself first, e.g. via scp, then call this).
+    Explicit refresh: always re-downloads (if CSV_SOURCE_URL is set) and
+    always rebuilds the SQLite database, regardless of FORCE_DOWNLOAD/
+    FORCE_REBUILD settings — this endpoint IS the "force" trigger.
     """
     if settings.reload_token:
         if x_reload_token != settings.reload_token:
             raise HTTPException(status_code=401, detail="Invalid or missing X-Reload-Token header.")
 
-    with _data_lock:
-        try:
-            refresh_data()
-        except Exception as e:
-            logger.exception("Reload failed")
-            raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
+    try:
+        ensure_data_ready(force_download=True, force_rebuild=True)
+    except Exception as e:
+        logger.exception("Reload failed")
+        raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
 
-    return {
-        "status": "reloaded",
-        "rows_loaded": _state["row_count"],
-        "loaded_at": _last_loaded_at.isoformat(),
-    }
+    return {"status": "reloaded", "ready_at": _last_ready_at.isoformat()}
 
 
 @app.get("/records/{row_id}")
 def get_record(row_id: int):
-    df = get_df()
-    match = df[df["_row_id"] == row_id]
-    if match.empty:
+    conn = get_connection()
+    try:
+        row = conn.execute(f'SELECT * FROM {TABLE} WHERE "_row_id" = ?', (row_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
         raise HTTPException(status_code=404, detail="Record not found.")
-    return match.drop(columns=["_row_id"]).iloc[0].to_dict()
+    result = dict(row)
+    result.pop("_row_id", None)
+    return result
 
 
 @app.get("/search")
@@ -183,13 +289,12 @@ def search(
     columns: Optional[str] = Query(
         None,
         description="Comma-separated column names to search in. Defaults to config, "
-                    "or all text columns if not configured. See /columns for options.",
+                    "or all columns if not configured. See /columns for options.",
     ),
     exact: bool = Query(False, description="If true, match the whole field exactly instead of substring."),
     page: int = Query(1, ge=1),
     page_size: int = Query(settings.default_page_size, ge=1),
 ):
-    df = get_df()
     page_size = min(page_size, settings.max_page_size)
 
     search_cols = None
@@ -197,28 +302,39 @@ def search(
         search_cols = [c.strip() for c in columns.split(",") if c.strip()]
     elif settings.default_search_columns:
         search_cols = [c.strip() for c in settings.default_search_columns.split(",") if c.strip()]
-
     if search_cols:
-        missing = [c for c in search_cols if c not in df.columns]
+        missing = [c for c in search_cols if c not in _columns or not _valid_identifier(c)]
         if missing:
             raise HTTPException(status_code=400, detail=f"Unknown columns: {missing}. See /columns.")
     else:
-        search_cols = [c for c in df.columns if c != "_row_id"]
+        search_cols = _columns
 
-    result = df
-    if q:
-        mask = pd.Series(False, index=df.index)
-        for col in search_cols:
+    conn = get_connection()
+    try:
+        params = []
+        where_sql = ""
+        if q:
             if exact:
-                mask |= df[col].str.lower() == q.lower()
+                clauses = [f'LOWER("{c}") = ?' for c in search_cols]
+                params = [q.lower()] * len(search_cols)
             else:
-                mask |= df[col].str.contains(q, case=False, na=False, regex=False)
-        result = df[mask]
+                clauses = [f'"{c}" LIKE ? ESCAPE \'\\\'' for c in search_cols]
+                params = [f"%{_escape_like(q)}%"] * len(search_cols)
+            where_sql = "WHERE " + " OR ".join(clauses)
 
-    total = len(result)
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_df = result.iloc[start:end].drop(columns=["_row_id"], errors="ignore")
+        total = conn.execute(f"SELECT COUNT(*) FROM {TABLE} {where_sql}", params).fetchone()[0]
+
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f'SELECT * FROM {TABLE} {where_sql} LIMIT ? OFFSET ?',
+            params + [page_size, offset],
+        ).fetchall()
+    finally:
+        conn.close()
+
+    results = [dict(r) for r in rows]
+    for r in results:
+        r.pop("_row_id", None)
 
     return {
         "query": q,
@@ -226,8 +342,8 @@ def search(
         "total": total,
         "page": page,
         "page_size": page_size,
-        "total_pages": math.ceil(total / page_size) if page_size else 0,
-        "results": page_df.to_dict(orient="records"),
+        "total_pages": (total + page_size - 1) // page_size if page_size else 0,
+        "results": results,
     }
 
 
@@ -239,17 +355,27 @@ def filter_exact(
     page_size: int = Query(settings.default_page_size, ge=1),
 ):
     """Exact-match filter on a single column, e.g. /filter?column=family&value=Orchidaceae"""
-    df = get_df()
-    if column not in df.columns:
+    if column not in _columns or not _valid_identifier(column):
         raise HTTPException(status_code=400, detail=f"Unknown column '{column}'. See /columns.")
 
     page_size = min(page_size, settings.max_page_size)
-    result = df[df[column].str.lower() == value.lower()]
+    offset = (page - 1) * page_size
 
-    total = len(result)
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_df = result.iloc[start:end].drop(columns=["_row_id"], errors="ignore")
+    conn = get_connection()
+    try:
+        total = conn.execute(
+            f'SELECT COUNT(*) FROM {TABLE} WHERE LOWER("{column}") = ?', (value.lower(),)
+        ).fetchone()[0]
+        rows = conn.execute(
+            f'SELECT * FROM {TABLE} WHERE LOWER("{column}") = ? LIMIT ? OFFSET ?',
+            (value.lower(), page_size, offset),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    results = [dict(r) for r in rows]
+    for r in results:
+        r.pop("_row_id", None)
 
     return {
         "column": column,
@@ -257,6 +383,6 @@ def filter_exact(
         "total": total,
         "page": page,
         "page_size": page_size,
-        "total_pages": math.ceil(total / page_size) if page_size else 0,
-        "results": page_df.to_dict(orient="records"),
+        "total_pages": (total + page_size - 1) // page_size if page_size else 0,
+        "results": results,
     }

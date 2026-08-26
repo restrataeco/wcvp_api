@@ -7,6 +7,12 @@ class Settings(BaseSettings):
     # Path to the data file. Just replace this file and hit /reload — no re-import needed.
     csv_path: str = "data/wcvp_names.csv"
 
+    db_path: str = "data/wcvp.db"
+    build_chunk_size: int = 50000
+    index_columns: str = ""
+    force_download: bool = False
+    force_rebuild: bool = False
+
     # CSV files sometimes use ; or | as a separator depending on locale/export settings.
     csv_delimiter: str = ","
 
