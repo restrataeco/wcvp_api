@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     # columns are passed to /search. Leave blank to auto-search all text columns.
     default_search_columns: str = ""
 
+    csv_source_url: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
