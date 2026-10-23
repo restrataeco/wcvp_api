@@ -121,6 +121,39 @@ curl -X POST http://127.0.0.1:8000/reload -H "X-Reload-Token: <your RELOAD_TOKEN
 
 Set `UPDATE_CHECK_ENABLED=false` in `.env` to turn the daily check off.
 
+### Warnings and logs
+
+When something needs attention, the app keeps serving the last good data
+(if it has any) and reports the problem in three places:
+
+- **`GET /health`**: `status` is `ok`, `degraded` (serving, but something
+  needs attention) or `unavailable` (no data to serve; HTTP 503, handy for
+  uptime monitors). `warnings` lists each problem.
+- **The Swagger page (`/docs`)**: a banner at the top lists active warnings.
+  Refresh the page to see the current state.
+- **The log file** (`logs/wcvp_api.log`, rotated at 10MB, 5 kept): each
+  warning is logged once when it appears and once when it's resolved.
+
+| Warning | Meaning |
+|---|---|
+| `source_unreachable` | Can't reach Kew (network, DNS, firewall, or Kew is down) |
+| `source_not_found` | Kew returns 404: the zip was moved or renamed; set `WCVP_ZIP_URL` |
+| `source_not_zip` | The link returns a web page instead of a zip |
+| `source_redirected` | The link redirects elsewhere; it still works (info only) |
+| `zip_corrupt` | The download isn't a valid zip (cut off?); retried next check |
+| `zip_member_missing` | A CSV is missing from the zip; lists the CSVs found. Set `ZIP_NAMES_MEMBER` / `ZIP_DISTRIBUTION_MEMBER` |
+| `csv_format_changed` | A CSV lost columns the API needs, or its delimiter changed. The new release is not loaded |
+| `library_missing_<name>` | A Python library (sqlite3, pandas, requests, filelock, zlib) is missing |
+| `folder_not_writable:<path>` / `file_not_readable:<path>` / `permission_denied` | File permission problems |
+| `sqlite_unusable` / `sqlite_old` / `sqlite_error` | SQLite can't create a database, is older than 3.25 (slower search), or failed |
+| `disk_space_low` / `disk_full` | Less than `MIN_FREE_DISK_GB` free, or the disk filled up during an update |
+| `log_file_unwritable` | The log file can't be written; logs go to the console only |
+| `data_unavailable` | No database at all, so queries return 503 |
+
+A new release that fails any check is never swapped in: users keep getting
+the previous data until a good release arrives, and then the warning clears
+by itself.
+
 ## 5. Moving to production
 
 The dev command (`uvicorn --reload`) is for local testing only — single

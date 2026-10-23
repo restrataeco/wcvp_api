@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     update_check_hours: float = 24
     # Remembers which version of the zip the current CSVs came from.
     source_state_path: str = "data/wcvp_source.json"
+    # File names expected inside the zip. If Kew renames them, /health says
+    # so and lists the CSVs it found; set the new names here.
+    zip_names_member: str = "wcvp_names.csv"
+    zip_distribution_member: str = "wcvp_distribution.csv"
+
+    # Log file (rotated at LOG_MAX_MB, keeping LOG_BACKUP_COUNT old files).
+    log_path: str = "logs/wcvp_api.log"
+    log_max_mb: int = 10
+    log_backup_count: int = 5
+    # Warn when the data folder has less free space than this (an update
+    # needs room for the zip, both CSVs and a second database).
+    min_free_disk_gb: float = 2
 
     # extra="ignore": keys this app no longer uses (e.g. CSV_SOURCE_URL,
     # DEFAULT_PAGE_SIZE in an older .env) are skipped instead of failing startup.

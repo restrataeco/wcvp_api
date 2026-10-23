@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 .vscode/
 
+logs/
+*.log
+
 # Data: downloaded from Kew and rebuilt by the app, never committed.
 data/
 *.csv

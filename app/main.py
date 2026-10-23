@@ -18,38 +18,49 @@ Startup flow:
      UPDATE_CHECK_HOURS and repeats steps 1–2 only when Kew has a new release.
   4. POST /reload always does both steps — the explicit "refresh now" trigger.
 
-Once built, every request queries the SQLite file directly with indexed SQL —
-fast, low memory, and gives back exact total counts (no more "total: null").
+Anything that goes wrong along the way (Kew unreachable or moved, zip/CSV
+layout changed, missing library, permissions, disk space) is logged and shown
+on /health and the Swagger page — see app/monitoring.py. The app keeps serving
+the last good data whenever it has some.
 """
 
+from __future__ import annotations  # annotations mention sqlite3 even if it's missing
+
+import errno
 import json
 import logging
 import os
 import re
 import shutil
-import sqlite3
 import threading
 import time
 import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
-import pandas as pd
-import requests
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from filelock import FileLock
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 
+from app import monitoring
 from app.config import settings
+from app.monitoring import ERROR, INFO, WARNING, optional_import
 
-logging.basicConfig(level=logging.INFO)
+# Libraries the server might lack. The app still starts without them and
+# /health explains what's missing, instead of failing with an ImportError.
+sqlite3 = optional_import("sqlite3")
+pd = optional_import("pandas")
+requests = optional_import("requests")
+filelock = optional_import("filelock")
+optional_import("zlib")  # zipfile needs it to extract wcvp.zip
+
+monitoring.setup_logging(settings.log_path, settings.log_max_mb, settings.log_backup_count)
 logger = logging.getLogger("wcvp_api")
 
-app = FastAPI(
-    title="WCVP Data API",
-    description="Read-only API over a POWO/WCVP CSV export, backed by SQLite.",
-    version="3.0.0",
-)
+BASE_DESCRIPTION = "Read-only API over Kew's World Checklist of Vascular Plants, backed by SQLite."
+
+app = FastAPI(title="WCVP Data API", description=BASE_DESCRIPTION, version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +68,20 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _openapi_with_warnings() -> dict:
+    """Rebuilt on every /openapi.json request, so the Swagger page always shows
+    the current warnings at the top."""
+    return get_openapi(
+        title=app.title,
+        version=app.version,
+        description=monitoring.description_with_warnings(BASE_DESCRIPTION),
+        routes=app.routes,
+    )
+
+
+app.openapi = _openapi_with_warnings
 
 _build_lock = threading.Lock()
 _last_ready_at: Optional[datetime] = None
@@ -67,10 +92,33 @@ _stop_updates = threading.Event()
 
 # gunicorn runs several worker processes; this OS-level lock keeps them from
 # downloading or building at the same time. The OS releases it if a worker dies.
-_process_lock = FileLock(settings.db_path + ".lock")
+# Without filelock, fall back to an in-process lock (fine for a single worker).
+# The timeout is a safety net: another worker's build takes minutes, not hours.
+_process_lock = (
+    filelock.FileLock(settings.db_path + ".lock", timeout=3 * 3600) if filelock else threading.Lock()
+)
 
-# Members of Kew's wcvp.zip -> the setting that says where each one goes.
-ZIP_MEMBERS = {"wcvp_names.csv": "csv_path", "wcvp_distribution.csv": "distribution_csv_path"}
+# Setting holding each expected zip member's name -> setting saying where it goes.
+ZIP_MEMBERS = {"zip_names_member": "csv_path", "zip_distribution_member": "distribution_csv_path"}
+
+# Columns the API relies on; a new release missing any of them is not loaded.
+REQUIRED_COLUMNS = {
+    "zip_names_member": [
+        "plant_name_id", "ipni_id", "taxon_rank", "taxon_status", "family", "genus",
+        "species", "infraspecies", "taxon_name", "taxon_authors", "accepted_plant_name_id",
+    ],
+    "zip_distribution_member": [
+        "plant_name_id", "continent_code_l1", "continent", "region_code_l2", "region",
+        "area_code_l3", "area", "introduced", "extinct", "location_doubtful",
+    ],
+}
+
+# Warnings about one download/extract/build attempt; cleared when one succeeds.
+REFRESH_CODES = (
+    "zip_corrupt", "zip_member_missing", "csv_format_changed", "permission_denied",
+    "disk_full", "sqlite_error", "update_failed", "data_unavailable",
+)
+SOURCE_CODES = ("source_unreachable", "source_not_found", "source_not_zip")
 
 TABLE = "records"
 DIST_TABLE = "distribution"
@@ -82,6 +130,14 @@ PAGE_SIZE = 10
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")  # guards against SQL injection via column names
 
 
+class SourceError(Exception):
+    """A problem with Kew's zip or its contents, with a warning code for /health."""
+
+    def __init__(self, code: str, message: str, level: str = ERROR, **detail):
+        super().__init__(message)
+        self.code, self.message, self.level, self.detail = code, message, level, detail
+
+
 def _valid_identifier(name: str) -> bool:
     return bool(IDENTIFIER_RE.match(name))
 
@@ -89,6 +145,45 @@ def _valid_identifier(name: str) -> bool:
 def _escape_like(value: str) -> str:
     """Escape % _ and \\ so user input can't inject LIKE wildcards."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _require(lib, name: str) -> None:
+    if lib is None:
+        # Same code as the startup environment check, so it updates that warning.
+        raise SourceError(
+            f"library_missing_{name}",
+            f"Python library '{name}' is not available; it's needed for "
+            f"{monitoring.LIBRARY_PURPOSE[name]}. Install it (pip install -r requirements.txt) "
+            "and restart.",
+        )
+
+
+def _serving_note() -> str:
+    """Appended to warnings, so readers know what users are getting meanwhile."""
+    if os.path.exists(settings.db_path):
+        version = (read_local_version() or {}).get("last_modified")
+        return f" Still serving the previous data ({version or 'release date unknown'})."
+    return " No data is loaded yet, so the API can't answer queries."
+
+
+def _check_data_folder_writable() -> None:
+    """
+    Fails fast with a clear warning if the data folder is read-only. Without
+    this, filelock can't create its lock file there and would retry until
+    its timeout, hanging startup instead of reporting the problem.
+    """
+    data_dir = os.path.dirname(settings.db_path) or "."
+    problem = monitoring.writable_dir_problem(data_dir)
+    if problem:
+        raise SourceError(
+            f"folder_not_writable:{data_dir}",
+            f"Can't write to {os.path.abspath(data_dir)} ({problem}). Downloading, extracting "
+            "and rebuilding the data will fail. Give the app's user write access.",
+        )
+
+
+def _kew_folder() -> str:
+    return settings.wcvp_zip_url.rsplit("/", 1)[0] + "/"
 
 
 # --- Source: Kew's wcvp.zip ---------------------------------------------------
@@ -101,10 +196,52 @@ def _version_from_headers(headers) -> dict:
     }
 
 
+def _check_response(r) -> None:
+    """Turns a bad response from Kew into a SourceError with a clear reason."""
+    url = settings.wcvp_zip_url
+    if r.status_code in (404, 410):
+        raise SourceError(
+            "source_not_found",
+            f"{url} returned HTTP {r.status_code}: Kew may have moved or renamed wcvp.zip. "
+            f"Check {_kew_folder()} and set WCVP_ZIP_URL to the new link.",
+            status=r.status_code,
+        )
+    if r.status_code >= 400:
+        raise SourceError(
+            "source_unreachable", f"{url} returned HTTP {r.status_code}.", status=r.status_code
+        )
+    if r.history and r.url != url:
+        monitoring.warn(
+            "source_redirected",
+            f"{url} now redirects to {r.url}. It still works, but Kew may have moved the "
+            "file — consider setting WCVP_ZIP_URL to the new address.",
+            level=INFO,
+            new_url=r.url,
+        )
+    else:
+        monitoring.clear("source_redirected")
+    content_type = r.headers.get("Content-Type", "")
+    if not any(t in content_type for t in ("zip", "octet-stream")):
+        raise SourceError(
+            "source_not_zip",
+            f"{url} returned '{content_type or 'no content type'}' instead of a zip file: the "
+            f"link may now point to a web page. Check {_kew_folder()} and update WCVP_ZIP_URL.",
+            content_type=content_type,
+        )
+
+
 def fetch_remote_version() -> dict:
     """One HEAD request: what version of the zip Kew is serving right now."""
-    r = requests.head(settings.wcvp_zip_url, timeout=30, allow_redirects=True)
-    r.raise_for_status()
+    _require(requests, "requests")
+    try:
+        r = requests.head(settings.wcvp_zip_url, timeout=30, allow_redirects=True)
+    except requests.RequestException as e:
+        raise SourceError(
+            "source_unreachable",
+            f"Can't reach {settings.wcvp_zip_url} ({type(e).__name__}: {e}). Check the server's "
+            "internet access, DNS and firewall, and whether sftp.kew.org is up.",
+        )
+    _check_response(r)
     return _version_from_headers(r.headers)
 
 
@@ -113,7 +250,7 @@ def read_local_version() -> Optional[dict]:
     try:
         with open(settings.source_state_path, encoding="utf-8") as f:
             return json.load(f)
-    except (FileNotFoundError, ValueError):
+    except (OSError, ValueError):
         return None
 
 
@@ -135,39 +272,91 @@ def _same_version(remote: dict, local: Optional[dict]) -> bool:
     return False
 
 
+def _validate_csv(path: str, member_setting: str) -> None:
+    """Checks a freshly extracted CSV has the delimiter and columns we rely on."""
+    member = getattr(settings, member_setting)
+    header = list(pd.read_csv(path, delimiter=settings.csv_delimiter, nrows=0, dtype=str).columns)
+    if len(header) <= 1:
+        raise SourceError(
+            "csv_format_changed",
+            f"{member} in the new release has {len(header)} column(s) when split on "
+            f"'{settings.csv_delimiter}': Kew may have changed the delimiter. Set CSV_DELIMITER "
+            "to match the file.",
+            header=header[:1],
+        )
+    missing = [c for c in REQUIRED_COLUMNS[member_setting] if c not in header]
+    if missing:
+        raise SourceError(
+            "csv_format_changed",
+            f"{member} in the new release is missing columns the API needs: {missing}. "
+            "Kew may have renamed them; the new release was not loaded.",
+            missing_columns=missing,
+            found_columns=header,
+        )
+
+
 def download_and_extract_zip() -> dict:
     """
-    Downloads wcvp.zip and extracts both CSVs. Everything goes to temp files
-    first and is renamed into place only once both CSVs extracted cleanly, so
-    a failed or corrupt download leaves the current CSVs untouched.
+    Downloads wcvp.zip, extracts both CSVs and checks their columns. Everything
+    goes to temp files first and is renamed into place only once both CSVs are
+    extracted and valid, so a failed download, a corrupt zip or a changed
+    layout leaves the current CSVs untouched.
     """
+    _require(requests, "requests")
+    _require(pd, "pandas")
+    if "zlib" in monitoring.missing_libraries:
+        _require(None, "zlib")
+
     zip_tmp = settings.db_path + ".zip.tmp"
     os.makedirs(os.path.dirname(zip_tmp) or ".", exist_ok=True)
 
     logger.info(f"Downloading {settings.wcvp_zip_url} ...")
-    with requests.get(settings.wcvp_zip_url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        version = _version_from_headers(r.headers)
-        with open(zip_tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):  # 8MB chunks
-                if chunk:
-                    f.write(chunk)
+    try:
+        with requests.get(settings.wcvp_zip_url, stream=True, timeout=120) as r:
+            _check_response(r)
+            version = _version_from_headers(r.headers)
+            with open(zip_tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):  # 8MB chunks
+                    if chunk:
+                        f.write(chunk)
+    except requests.RequestException as e:
+        raise SourceError(
+            "source_unreachable",
+            f"Download of {settings.wcvp_zip_url} failed ({type(e).__name__}: {e}).",
+        )
 
     extracted = []  # (tmp_path, final_path)
     try:
-        with zipfile.ZipFile(zip_tmp) as zf:
+        try:
+            zf = zipfile.ZipFile(zip_tmp)
+        except zipfile.BadZipFile as e:
+            raise SourceError(
+                "zip_corrupt",
+                f"The downloaded wcvp.zip is not a valid zip ({e}). The download may have been "
+                "cut off, or the link now serves something else; will retry next check.",
+            )
+        with zf:
             by_name = {os.path.basename(n): n for n in zf.namelist()}
-            missing = [m for m in ZIP_MEMBERS if m not in by_name]
-            if missing:
-                raise ValueError(f"{settings.wcvp_zip_url} does not contain {missing}")
-            for member, setting_name in ZIP_MEMBERS.items():
-                dest = getattr(settings, setting_name)
+            csvs_in_zip = sorted(n for n in by_name if n.lower().endswith(".csv"))
+            for member_setting, path_setting in ZIP_MEMBERS.items():
+                member = getattr(settings, member_setting)
+                if member not in by_name:
+                    raise SourceError(
+                        "zip_member_missing",
+                        f"wcvp.zip no longer contains '{member}'. CSV files in the zip: "
+                        f"{csvs_in_zip or 'none'}. If Kew renamed it, set "
+                        f"{member_setting.upper()} to the new name in .env.",
+                        expected=member,
+                        csv_files_in_zip=csvs_in_zip,
+                    )
+                dest = getattr(settings, path_setting)
                 os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
                 tmp = dest + ".tmp"
                 logger.info(f"  ...extracting {member}")
                 with zf.open(by_name[member]) as src, open(tmp, "wb") as out:
                     shutil.copyfileobj(src, out, 8 * 1024 * 1024)
                 extracted.append((tmp, dest))
+                _validate_csv(tmp, member_setting)
         for tmp, dest in extracted:
             os.replace(tmp, dest)
             logger.info(f"  ...{dest} updated")
@@ -192,6 +381,8 @@ def build_sqlite_from_csv() -> None:
     atomically renames into place at the end, so any request hitting the
     real DB_PATH mid-build still sees the last good, fully-built database.
     """
+    _require(sqlite3, "sqlite3")
+    _require(pd, "pandas")
     os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
     tmp_db_path = settings.db_path + ".building"
     if os.path.exists(tmp_db_path):
@@ -248,13 +439,12 @@ def build_sqlite_from_csv() -> None:
 def _build_distribution_table(conn: sqlite3.Connection) -> None:
     """
     Loads wcvp_distribution.csv into its own table in the same DB file, indexed
-    on plant_name_id so each page of results needs only one extra lookup.
-    Optional: if the file isn't there, the API runs without distribution data.
+    on plant_name_id for the /distribution lookup.
     """
     if not os.path.exists(settings.distribution_csv_path):
         logger.warning(
             f"No distribution file at {settings.distribution_csv_path} — "
-            "results will be served without distribution data."
+            "/distribution will be unavailable."
         )
         return
 
@@ -314,7 +504,7 @@ def ensure_indexes(db_path: Optional[str] = None) -> None:
 
 
 def db_has_distribution() -> bool:
-    if not os.path.exists(settings.db_path):
+    if sqlite3 is None or not os.path.exists(settings.db_path):
         return False
     conn = sqlite3.connect(settings.db_path)
     try:
@@ -335,11 +525,45 @@ def read_columns_from_db() -> list:
         conn.close()
 
 
+def _load_db_state() -> None:
+    """Reads columns/distribution flags from whatever DB is on disk."""
+    global _columns, _has_distribution
+    if sqlite3 is not None and os.path.exists(settings.db_path):
+        _columns = read_columns_from_db()
+        _has_distribution = db_has_distribution()
+
+
 # --- Startup / refresh orchestration ----------------------------------------
+
+def _record_failure(e: Exception, action: str) -> None:
+    """Turns any failure while refreshing data into a warning with a clear reason."""
+    note = _serving_note()
+    if isinstance(e, SourceError):
+        monitoring.warn(e.code, e.message + note, level=e.level, **e.detail)
+    elif isinstance(e, PermissionError):
+        monitoring.warn(
+            "permission_denied",
+            f"{action} failed: no permission to access {e.filename or 'a data file'}. Give the "
+            f"app's user read/write access to the data folder.{note}",
+            level=ERROR,
+        )
+    elif isinstance(e, OSError) and e.errno == errno.ENOSPC:
+        monitoring.warn("disk_full", f"{action} failed: the disk is full. Free some space.{note}",
+                        level=ERROR)
+    elif sqlite3 is not None and isinstance(e, sqlite3.Error):
+        monitoring.warn("sqlite_error", f"{action} failed with a SQLite error: "
+                        f"{str(e).rstrip('.')}.{note}", level=ERROR)
+        logger.exception(f"{action} failed")
+    else:
+        monitoring.warn("update_failed", f"{action} failed: {type(e).__name__}: "
+                        f"{str(e).rstrip('.')}.{note}", level=ERROR)
+        # Unexpected, so keep the traceback; the known cases above explain themselves.
+        logger.exception(f"{action} failed")
+
 
 def _refresh_locked(force_download: bool = False, force_rebuild: bool = False) -> None:
     """The readiness flow itself; callers must hold both locks."""
-    global _last_ready_at, _columns, _has_distribution
+    global _last_ready_at
 
     missing_csvs = [
         p for p in (settings.csv_path, settings.distribution_csv_path) if not os.path.exists(p)
@@ -361,9 +585,9 @@ def _refresh_locked(force_download: bool = False, force_rebuild: bool = False) -
         logger.info(f"Using existing SQLite DB at {settings.db_path} (no rebuild needed).")
 
     ensure_indexes()
-    _columns = read_columns_from_db()
-    _has_distribution = db_has_distribution()
+    _load_db_state()
     _last_ready_at = datetime.now(timezone.utc)
+    monitoring.clear(*REFRESH_CODES)
 
 
 def ensure_data_ready(force_download: bool = False, force_rebuild: bool = False) -> None:
@@ -374,7 +598,8 @@ def ensure_data_ready(force_download: bool = False, force_rebuild: bool = False)
     A plain process restart with existing CSVs + existing DB does neither —
     it just starts serving immediately.
     """
-    os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
+    _require(sqlite3, "sqlite3")
+    _check_data_folder_writable()
     with _build_lock, _process_lock:
         _refresh_locked(force_download, force_rebuild)
 
@@ -387,8 +612,17 @@ def check_for_update() -> dict:
     one downloads — the others then see the version it saved.
     """
     global _last_update_check
-    remote = fetch_remote_version()
-    os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
+    monitoring.check_environment(settings, sqlite3)
+    checked_at = datetime.now(timezone.utc).isoformat()
+    try:
+        remote = fetch_remote_version()
+        _check_data_folder_writable()
+    except Exception as e:
+        _record_failure(e, "Checking Kew for a new release")
+        _last_update_check = {"checked_at": checked_at, "error": str(e), "updated": False}
+        raise
+    monitoring.clear(*SOURCE_CODES)
+
     with _build_lock, _process_lock:
         local = read_local_version()
         updated = not _same_version(remote, local)
@@ -397,14 +631,17 @@ def check_for_update() -> dict:
                 f"New WCVP release (Last-Modified {remote['last_modified']}, "
                 f"had {local.get('last_modified') if local else 'unknown'}) - updating."
             )
-            _refresh_locked(force_download=True, force_rebuild=True)
+            try:
+                _refresh_locked(force_download=True, force_rebuild=True)
+            except Exception as e:
+                _record_failure(e, "Updating to the new WCVP release")
+                _last_update_check = {
+                    "checked_at": checked_at, "remote": remote, "error": str(e), "updated": False,
+                }
+                raise
         else:
             logger.info(f"WCVP zip unchanged (Last-Modified {remote['last_modified']}).")
-    _last_update_check = {
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-        "remote": remote,
-        "updated": updated,
-    }
+    _last_update_check = {"checked_at": checked_at, "remote": remote, "updated": updated}
     return _last_update_check
 
 
@@ -414,15 +651,27 @@ def _update_loop() -> None:
         try:
             check_for_update()
         except Exception:
-            logger.exception("WCVP update check failed; will retry at the next interval.")
+            pass  # already logged and shown as a warning; retry next interval
         if _stop_updates.wait(settings.update_check_hours * 3600):
             return
 
 
 @app.on_event("startup")
 def startup_event():
-    ensure_data_ready()
-    if settings.update_check_enabled:
+    monitoring.check_environment(settings, sqlite3)
+    try:
+        ensure_data_ready()
+    except Exception as e:
+        _record_failure(e, "Preparing the data at startup")
+        _load_db_state()  # keep serving an older DB if there is one
+    if sqlite3 is None or not os.path.exists(settings.db_path):
+        monitoring.warn(
+            "data_unavailable",
+            "No database is available, so search, filter and distribution return 503. "
+            "See the other warnings for why it couldn't be built.",
+            level=ERROR,
+        )
+    if settings.update_check_enabled and requests is not None:
         threading.Thread(target=_update_loop, name="wcvp-update-check", daemon=True).start()
 
 
@@ -432,8 +681,10 @@ def shutdown_event():
 
 
 def get_connection() -> sqlite3.Connection:
+    if sqlite3 is None:
+        raise HTTPException(status_code=503, detail="SQLite is not available on this server. See /health.")
     if not os.path.exists(settings.db_path):
-        raise HTTPException(status_code=503, detail="Database not ready yet.")
+        raise HTTPException(status_code=503, detail="Database not ready yet. See /health.")
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
     return conn
@@ -486,6 +737,27 @@ ORDER_SQL = (
 )
 
 
+def _fetch_page(conn, rank_sql: str, rank_params: list, where_sql: str, where_params: list,
+                page: int) -> tuple:
+    """
+    One page of ranked rows plus the total match count. On SQLite 3.25+ the
+    total comes from COUNT(*) OVER () in the same pass; older SQLite has no
+    window functions, so it takes a second COUNT query.
+    """
+    has_window = sqlite3.sqlite_version_info >= (3, 25, 0)
+    total_sql = ", COUNT(*) OVER () AS _total" if has_window else ""
+    rows = conn.execute(
+        f"SELECT *, {rank_sql} AS _rank{total_sql} "
+        f"FROM {TABLE} WHERE {where_sql} {ORDER_SQL} LIMIT ? OFFSET ?",
+        rank_params + where_params + [PAGE_SIZE, (page - 1) * PAGE_SIZE],
+    ).fetchall()
+    if rows and has_window:
+        return rows, rows[0]["_total"]
+    # Older SQLite, or past the last page: still report the real total.
+    total = conn.execute(f"SELECT COUNT(*) FROM {TABLE} WHERE {where_sql}", where_params).fetchone()[0]
+    return rows, total
+
+
 def _page_response(rows: list, total: int, page: int, **extra) -> dict:
     results = []
     for row in rows:
@@ -520,22 +792,47 @@ def _parse_name_columns(columns: Optional[str]) -> list:
 
 @app.get("/health")
 def health():
-    db_size_mb = round(os.path.getsize(settings.db_path) / (1024 * 1024), 1) if os.path.exists(settings.db_path) else None
+    """
+    Status, loaded data, and every active warning (Kew link unreachable or
+    moved, zip/CSV layout changed, missing libraries, permissions, disk space).
+    status is "ok", "degraded" (serving, but something needs attention) or
+    "unavailable" (no data to serve; HTTP 503).
+    """
+    db_available = sqlite3 is not None and os.path.exists(settings.db_path)
+    db_size_mb = round(os.path.getsize(settings.db_path) / (1024 * 1024), 1) if db_available else None
     row_count = None
-    if os.path.exists(settings.db_path):
-        conn = get_connection()
+    if db_available:
         try:
-            row_count = conn.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
-        finally:
-            conn.close()
-    return {
-        "status": "ok",
+            conn = get_connection()
+            try:
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+            finally:
+                conn.close()
+            monitoring.clear("database_unreadable")
+        except Exception as e:
+            db_available = False
+            monitoring.warn("database_unreadable", f"The database at {settings.db_path} can't be "
+                            f"queried: {e}", level=ERROR)
+
+    warnings = monitoring.active()
+    if not db_available:
+        status = "unavailable"
+    elif any(w["level"] in (ERROR, WARNING) for w in warnings):
+        status = "degraded"
+    else:
+        status = "ok"
+    body = {
+        "status": status,
         "db_size_mb": db_size_mb,
         "row_count": row_count,
         "distribution_loaded": _has_distribution,
         "ready_at": _last_ready_at.isoformat() if _last_ready_at else None,
         "data_version": (read_local_version() or {}).get("last_modified"),
+        "last_update_check": _last_update_check,
+        "log_file": os.path.abspath(settings.log_path),
+        "warnings": warnings,
     }
+    return JSONResponse(body, status_code=503 if status == "unavailable" else 200)
 
 
 @app.get("/columns")
@@ -549,6 +846,7 @@ def source():
     """Where the data comes from, which release is loaded, and the last update check."""
     return {
         "zip_url": settings.wcvp_zip_url,
+        "zip_members": {s: getattr(settings, s) for s in ZIP_MEMBERS},
         "loaded_version": read_local_version(),
         "update_check_enabled": settings.update_check_enabled,
         "update_check_hours": settings.update_check_hours,
@@ -571,7 +869,6 @@ def check_update(x_reload_token: Optional[str] = Header(None)):
     try:
         return check_for_update()
     except Exception as e:
-        logger.exception("Update check failed")
         raise HTTPException(status_code=502, detail=f"Update check failed: {e}")
 
 
@@ -583,11 +880,11 @@ def reload_data(x_reload_token: Optional[str] = Header(None)):
     the "force" trigger. Use /check-update to download only when newer.
     """
     _require_reload_token(x_reload_token)
-
+    monitoring.check_environment(settings, sqlite3)
     try:
         ensure_data_ready(force_download=True, force_rebuild=True)
     except Exception as e:
-        logger.exception("Reload failed")
+        _record_failure(e, "Reload")
         raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
 
     return {"status": "reloaded", "ready_at": _last_ready_at.isoformat()}
@@ -616,7 +913,7 @@ def get_distribution(ipni_id: str):
     (see accepted_plant_name_id).
     """
     if not _has_distribution:
-        raise HTTPException(status_code=503, detail="Distribution data is not loaded.")
+        raise HTTPException(status_code=503, detail="Distribution data is not loaded. See /health.")
     conn = get_connection()
     try:
         # An ipni_id is normally unique; if not, prefer the accepted name.
@@ -680,18 +977,7 @@ def search(
 
     conn = get_connection()
     try:
-        # COUNT(*) OVER () gives the total in the same pass as the page.
-        rows = conn.execute(
-            f"SELECT *, {rank_sql} AS _rank, COUNT(*) OVER () AS _total "
-            f"FROM {TABLE} WHERE {where_sql} {ORDER_SQL} LIMIT ? OFFSET ?",
-            rank_params + where_params + [PAGE_SIZE, (page - 1) * PAGE_SIZE],
-        ).fetchall()
-        if rows:
-            total = rows[0]["_total"]
-        else:  # past the last page: still report the real total
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM {TABLE} WHERE {where_sql}", where_params
-            ).fetchone()[0]
+        rows, total = _fetch_page(conn, rank_sql, rank_params, where_sql, where_params, page)
     finally:
         conn.close()
 
@@ -715,17 +1001,7 @@ def filter_exact(
 
     conn = get_connection()
     try:
-        rows = conn.execute(
-            f"SELECT *, 0 AS _rank, COUNT(*) OVER () AS _total FROM {TABLE} "
-            f'WHERE "{col}" = ? COLLATE NOCASE {ORDER_SQL} LIMIT ? OFFSET ?',
-            (value, PAGE_SIZE, (page - 1) * PAGE_SIZE),
-        ).fetchall()
-        if rows:
-            total = rows[0]["_total"]
-        else:
-            total = conn.execute(
-                f'SELECT COUNT(*) FROM {TABLE} WHERE "{col}" = ? COLLATE NOCASE', (value,)
-            ).fetchone()[0]
+        rows, total = _fetch_page(conn, "0", [], f'"{col}" = ? COLLATE NOCASE', [value], page)
     finally:
         conn.close()
 
