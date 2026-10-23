@@ -672,7 +672,7 @@ def _prepare_data() -> None:
         )
 
 
-_started = False
+_started_pid: Optional[int] = None  # a pid, not a flag: a forked child must start its own
 _start_lock = threading.Lock()
 
 
@@ -688,11 +688,11 @@ def start_services(background: bool = False) -> None:
       data prep runs in a background thread (background=True). Until the
       first build finishes, queries return 503 and /health says it's preparing.
     """
-    global _started
+    global _started_pid
     with _start_lock:
-        if _started:
+        if _started_pid == os.getpid():
             return
-        _started = True
+        _started_pid = os.getpid()
 
     monitoring.check_environment(settings, sqlite3)
     run_updates = settings.update_check_enabled and requests is not None
@@ -702,6 +702,13 @@ def start_services(background: bool = False) -> None:
         if run_updates:
             threading.Thread(target=_update_loop, name="wcvp-update-check", daemon=True).start()
         return
+
+    # Reading the column list from an existing DB takes milliseconds; do it now,
+    # or the first requests would see no columns while the thread starts up.
+    try:
+        _load_db_state()
+    except Exception as e:
+        _record_failure(e, "Reading the existing database")
 
     def prepare_then_watch():
         if not os.path.exists(settings.db_path):
