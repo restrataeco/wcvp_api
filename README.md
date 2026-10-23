@@ -79,6 +79,39 @@ many there are.
 `/filter` is an exact, case-insensitive match on one of those columns,
 accepted names first.
 
+#### Column filters
+
+Both endpoints also take column filters as plain query parameters:
+
+```
+GET /search?q=tamarind&taxon_rank=Species&taxon_status=Accepted
+GET /search?q=tamarind&taxon_status=Accepted&taxon_status=Synonym
+GET /search?q=rosa&lifeform_description=climber
+GET /filter?column=family&value=Fabaceae&taxon_rank=Genus
+```
+
+| Filter | Example values |
+|---|---|
+| `taxon_rank` | Species, Genus, Subspecies, Variety, Form |
+| `taxon_status` | Accepted, Synonym, Illegitimate, Unplaced, … |
+| `family` | Fabaceae |
+| `genus` | Tamarindus |
+| `lifeform_description` | tree, perennial, shrub or tree |
+| `climate_description` | wet tropical, temperate, subtropical, … |
+| `reviewed` | Y, N |
+
+- Matching is exact and case-insensitive.
+- Different filters combine with AND. Repeat a filter to allow several
+  values (OR), e.g. `taxon_status=Accepted&taxon_status=Synonym`.
+- Applied filters are echoed back in the response's `filters` field.
+- Mistakes are a 400 error instead of being ignored. An unknown parameter
+  (e.g. `taxon_rnk=`) lists the accepted ones. A value that doesn't exist
+  for `taxon_rank`, `taxon_status`, `climate_description` or `reviewed`
+  (e.g. `taxon_rank=Speicies`) lists the valid values.
+
+WCVP has scientific names only. `q=tamarind` works because it's part of
+*Tamarindus*, but a common name like "mango" won't find *Mangifera indica*.
+
 ### Distribution
 
 Search and filter results don't include distribution. Take the `ipni_id`
@@ -120,6 +153,39 @@ curl -X POST http://127.0.0.1:8000/reload -H "X-Reload-Token: <your RELOAD_TOKEN
 ```
 
 Set `UPDATE_CHECK_ENABLED=false` in `.env` to turn the daily check off.
+
+### Warnings and logs
+
+When something needs attention, the app keeps serving the last good data
+(if it has any) and reports the problem in three places:
+
+- **`GET /health`**: `status` is `ok`, `degraded` (serving, but something
+  needs attention) or `unavailable` (no data to serve; HTTP 503, handy for
+  uptime monitors). `warnings` lists each problem.
+- **The Swagger page (`/docs`)**: a banner at the top lists active warnings.
+  Refresh the page to see the current state.
+- **The log file** (`logs/wcvp_api.log`, rotated at 10MB, 5 kept): each
+  warning is logged once when it appears and once when it's resolved.
+
+| Warning | Meaning |
+|---|---|
+| `source_unreachable` | Can't reach Kew (network, DNS, firewall, or Kew is down) |
+| `source_not_found` | Kew returns 404: the zip was moved or renamed; set `WCVP_ZIP_URL` |
+| `source_not_zip` | The link returns a web page instead of a zip |
+| `source_redirected` | The link redirects elsewhere; it still works (info only) |
+| `zip_corrupt` | The download isn't a valid zip (cut off?); retried next check |
+| `zip_member_missing` | A CSV is missing from the zip; lists the CSVs found. Set `ZIP_NAMES_MEMBER` / `ZIP_DISTRIBUTION_MEMBER` |
+| `csv_format_changed` | A CSV lost columns the API needs, or its delimiter changed. The new release is not loaded |
+| `library_missing_<name>` | A Python library (sqlite3, pandas, requests, filelock, zlib) is missing |
+| `folder_not_writable:<path>` / `file_not_readable:<path>` / `permission_denied` | File permission problems |
+| `sqlite_unusable` / `sqlite_old` / `sqlite_error` | SQLite can't create a database, is older than 3.25 (slower search), or failed |
+| `disk_space_low` / `disk_full` | Less than `MIN_FREE_DISK_GB` free, or the disk filled up during an update |
+| `log_file_unwritable` | The log file can't be written; logs go to the console only |
+| `data_unavailable` | No database at all, so queries return 503 |
+
+A new release that fails any check is never swapped in: users keep getting
+the previous data until a good release arrives, and then the warning clears
+by itself.
 
 ## 5. Moving to production
 
