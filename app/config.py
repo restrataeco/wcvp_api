@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     update_check_hours: float = 24
     # Remembers which version of the zip the current CSVs came from.
     source_state_path: str = "data/wcvp_source.json"
+    # Last build/update result and its warnings, shared between the web app
+    # and the separate builder process (python -m app.build).
+    build_status_path: str = "data/build_status.json"
     # File names expected inside the zip. If Kew renames them, /health says
     # so and lists the CSVs it found; set the new names here.
     zip_names_member: str = "wcvp_names.csv"
