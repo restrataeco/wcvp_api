@@ -657,9 +657,7 @@ def _update_loop() -> None:
             return
 
 
-@app.on_event("startup")
-def startup_event():
-    monitoring.check_environment(settings, sqlite3)
+def _prepare_data() -> None:
     try:
         ensure_data_ready()
     except Exception as e:
@@ -672,8 +670,58 @@ def startup_event():
             "See the other warnings for why it couldn't be built.",
             level=ERROR,
         )
-    if settings.update_check_enabled and requests is not None:
-        threading.Thread(target=_update_loop, name="wcvp-update-check", daemon=True).start()
+
+
+_started = False
+_start_lock = threading.Lock()
+
+
+def start_services(background: bool = False) -> None:
+    """
+    Startup work: environment checks, data prep, and the daily update check.
+    Runs once per process, however often it's called.
+
+    - Under uvicorn/gunicorn it runs from the startup event and prepares the
+      data before serving (background=False).
+    - Under cPanel/Passenger (passenger_wsgi.py) there are no startup events,
+      and Passenger gives up on an app that takes minutes to start, so the
+      data prep runs in a background thread (background=True). Until the
+      first build finishes, queries return 503 and /health says it's preparing.
+    """
+    global _started
+    with _start_lock:
+        if _started:
+            return
+        _started = True
+
+    monitoring.check_environment(settings, sqlite3)
+    run_updates = settings.update_check_enabled and requests is not None
+
+    if not background:
+        _prepare_data()
+        if run_updates:
+            threading.Thread(target=_update_loop, name="wcvp-update-check", daemon=True).start()
+        return
+
+    def prepare_then_watch():
+        if not os.path.exists(settings.db_path):
+            monitoring.warn(
+                "data_preparing",
+                "Downloading wcvp.zip and building the database in the background. The "
+                "first start takes a few minutes; queries return 503 until it's done.",
+                level=INFO,
+            )
+        _prepare_data()
+        monitoring.clear("data_preparing")
+        if run_updates:
+            _update_loop()
+
+    threading.Thread(target=prepare_then_watch, name="wcvp-startup", daemon=True).start()
+
+
+@app.on_event("startup")
+def startup_event():
+    start_services()
 
 
 @app.on_event("shutdown")

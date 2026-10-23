@@ -219,6 +219,44 @@ Run this under a process manager (systemd, or `pm2`/`supervisor`) so it
 restarts automatically on crash or server reboot. Put nginx or Caddy in
 front for HTTPS and to avoid exposing port 8000 directly.
 
+**Option C — cPanel shared hosting ("Setup Python App"):**
+
+cPanel runs Python apps with Passenger, which speaks WSGI.
+`passenger_wsgi.py` wraps the FastAPI app with `a2wsgi` and starts the
+data prep and daily update check itself, since Passenger doesn't run
+FastAPI's startup events.
+
+1. Upload the project (without `venv/`, `data/` or `logs/`) to a folder in
+   your home directory, e.g. `wcvpapi.example.org/wcvp_api`.
+2. In **Setup Python App → Create Application**:
+
+   | Field | Value |
+   |---|---|
+   | Python version | 3.11 |
+   | Application root | the folder from step 1, e.g. `wcvpapi.example.org/wcvp_api` |
+   | Application URL | your domain; leave the path empty to serve at the root |
+   | Application startup file | `passenger_wsgi.py` |
+   | Application Entry point | `application` |
+   | Environment variables | `RELOAD_TOKEN` = a long random secret (or put it in a `.env` file in the application root) |
+
+3. Click **Create**, then install the dependencies: in the app's settings
+   page, enter `requirements.txt` under "Configuration files" and click
+   **Run Pip Install**. Or use the "Enter to the virtual environment"
+   command it shows, in cPanel's Terminal, then run
+   `pip install -r requirements.txt`.
+4. Click **Restart**. The first start downloads wcvp.zip and builds the
+   database in the background (2–5 minutes). Until then queries return
+   503, and `/health` shows `data_preparing`. Open `/health` or `/docs` to
+   follow along.
+
+Notes for shared hosting:
+- The account needs about 2GB of disk, and outbound HTTPS to `sftp.kew.org`.
+- Passenger stops idle apps. The next request starts the app again in a
+  few seconds, without rebuilding, and the update check runs then. So on
+  a quiet site, "daily" really means "at most daily, when there's traffic".
+- After uploading new code, click **Restart** (or touch `tmp/restart.txt`
+  in the application root).
+
 ## 6. Notes on scale
 
 - Data lives on disk in SQLite, not in memory, so RAM use is low. The CSVs
