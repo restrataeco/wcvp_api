@@ -1,10 +1,8 @@
-import os
-from pathlib import Path
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # Path to the data file. Just replace this file and hit /reload — no re-import needed.
+    # Where the CSVs extracted from Kew's zip are written and read.
     csv_path: str = "data/wcvp_names.csv"
 
     db_path: str = "data/wcvp.db"
@@ -13,26 +11,28 @@ class Settings(BaseSettings):
     force_download: bool = False
     force_rebuild: bool = False
 
-    # CSV files sometimes use ; or | as a separator depending on locale/export settings.
-    csv_delimiter: str = ","
+    # Kew's WCVP CSVs are pipe-delimited.
+    csv_delimiter: str = "|"
 
-    # Default page size for list/search endpoints, and the max a caller can request.
-    default_page_size: int = 20
-    max_page_size: int = 500
-
-    # Simple shared-secret token to protect the /reload endpoint in production.
+    # Simple shared-secret token to protect /reload and /check-update in production.
     # Set a real value in your .env file. Leave blank to disable auth (fine for local testing only).
     reload_token: str = ""
 
-    # Comma-separated list of column names to search across when no explicit
-    # columns are passed to /search. Leave blank to auto-search all text columns.
-    default_search_columns: str = ""
+    # Distribution data (wcvp_distribution.csv), joined to names on plant_name_id.
+    distribution_csv_path: str = "data/wcvp_distribution.csv"
 
-    csv_source_url: str = ""
+    # Kew publishes both CSVs in one zip, updated every 4–6 months. The app
+    # checks it every UPDATE_CHECK_HOURS (one small HEAD request) and only
+    # downloads, extracts and rebuilds when Kew's Last-Modified/ETag changes.
+    wcvp_zip_url: str = "https://sftp.kew.org/pub/data-repositories/WCVP/wcvp.zip"
+    update_check_enabled: bool = True
+    update_check_hours: float = 24
+    # Remembers which version of the zip the current CSVs came from.
+    source_state_path: str = "data/wcvp_source.json"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    # extra="ignore": keys this app no longer uses (e.g. CSV_SOURCE_URL,
+    # DEFAULT_PAGE_SIZE in an older .env) are skipped instead of failing startup.
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
 settings = Settings()

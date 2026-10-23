@@ -1,7 +1,16 @@
 venv/
 .env
-data/*.csv
 __pycache__/
 *.pyc
 .vscode/
+
+# Data: downloaded from Kew and rebuilt by the app, never committed.
 data/
+*.csv
+*.zip
+*.db
+*.db-journal
+*.db.building
+*.db.lock
+*.tmp
+wcvp_source.json
