@@ -4,4 +4,4 @@ pandas==2.2.2
 pydantic-settings==2.5.2
 gunicorn==23.0.0
 requests==2.32.3
-gdown==5.2.0
+filelock==3.16.1
