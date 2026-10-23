@@ -36,9 +36,9 @@ import threading
 import time
 import zipfile
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -531,6 +531,7 @@ def _load_db_state() -> None:
     if sqlite3 is not None and os.path.exists(settings.db_path):
         _columns = read_columns_from_db()
         _has_distribution = db_has_distribution()
+        _filter_values.clear()  # a new release may bring new ranks/statuses
 
 
 # --- Startup / refresh orchestration ----------------------------------------
@@ -775,6 +776,96 @@ def _page_response(rows: list, total: int, page: int, **extra) -> dict:
     }
 
 
+# --- Column filters (/search and /filter) ---------------------------------------
+
+# Extra filters both endpoints accept as plain query parameters, e.g.
+# ?taxon_rank=Species&taxon_status=Accepted. Exact and case-insensitive;
+# different filters combine with AND, a repeated filter means OR.
+FILTER_COLUMNS = {
+    "taxon_rank": "e.g. Species, Genus, Subspecies, Variety, Form",
+    "taxon_status": "e.g. Accepted, Synonym",
+    "family": "e.g. Fabaceae",
+    "genus": "e.g. Tamarindus",
+    "lifeform_description": "e.g. tree, perennial, shrub or tree",
+    "climate_description": "e.g. wet tropical, temperate",
+    "reviewed": "Y or N",
+}
+# Filters with a short, fixed set of values: an unknown value is a 400 that
+# lists the valid ones, so a typo like "Speicies" doesn't silently return nothing.
+ENUM_FILTERS = ("taxon_rank", "taxon_status", "climate_description", "reviewed")
+_filter_values: dict = {}  # column -> its distinct values, loaded on first use
+
+
+def _valid_filter_values(col: str) -> list:
+    if col not in _filter_values:
+        conn = get_connection()
+        try:
+            rows = conn.execute(f'SELECT DISTINCT "{col}" FROM {TABLE}').fetchall()
+        finally:
+            conn.close()
+        _filter_values[col] = sorted(v for (v,) in rows if v)
+    return _filter_values[col]
+
+
+def _filter_query(desc: str):
+    return Query(None, description=f"Exact match, case-insensitive ({desc}). "
+                                   "Repeat the parameter to allow several values.")
+
+
+def column_filters(
+    taxon_rank: Optional[List[str]] = _filter_query(FILTER_COLUMNS["taxon_rank"]),
+    taxon_status: Optional[List[str]] = _filter_query(FILTER_COLUMNS["taxon_status"]),
+    family: Optional[List[str]] = _filter_query(FILTER_COLUMNS["family"]),
+    genus: Optional[List[str]] = _filter_query(FILTER_COLUMNS["genus"]),
+    lifeform_description: Optional[List[str]] = _filter_query(FILTER_COLUMNS["lifeform_description"]),
+    climate_description: Optional[List[str]] = _filter_query(FILTER_COLUMNS["climate_description"]),
+    reviewed: Optional[List[str]] = _filter_query(FILTER_COLUMNS["reviewed"]),
+) -> dict:
+    """FastAPI dependency: the filters given, as {column: [values]}."""
+    given = {
+        "taxon_rank": taxon_rank, "taxon_status": taxon_status, "family": family,
+        "genus": genus, "lifeform_description": lifeform_description,
+        "climate_description": climate_description, "reviewed": reviewed,
+    }
+    return {col: values for col, values in given.items() if values is not None}
+
+
+def _reject_unknown_params(request: Request, own_params: tuple) -> None:
+    """400 for parameters the endpoint doesn't know, instead of ignoring them."""
+    allowed = set(own_params) | set(FILTER_COLUMNS)
+    unknown = sorted(set(request.query_params) - allowed)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown parameter(s): {unknown}. This endpoint accepts {list(own_params)} "
+                   f"and these filters: {list(FILTER_COLUMNS)}.",
+        )
+
+
+def _filters_sql(filters: dict) -> tuple:
+    """Validates the filters and returns (sql, params, applied) to AND onto a query."""
+    clauses, params, applied = [], [], {}
+    for col, raw_values in filters.items():
+        values = [v.strip() for v in raw_values if v.strip()]
+        if not values:
+            raise HTTPException(status_code=400, detail=f"Filter '{col}' needs a value.")
+        if col not in _columns:
+            raise HTTPException(status_code=400, detail=f"Filter '{col}' isn't in this data release.")
+        if col in ENUM_FILTERS:
+            valid = _valid_filter_values(col)
+            known = {v.lower() for v in valid}
+            invalid = [v for v in values if v.lower() not in known]
+            if invalid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid {col} value(s): {invalid}. Valid values: {valid}.",
+                )
+        clauses.append("(" + " OR ".join(f'"{col}" = ? COLLATE NOCASE' for _ in values) + ")")
+        params += values
+        applied[col] = values[0] if len(values) == 1 else values
+    return " AND ".join(clauses), params, applied
+
+
 def _parse_name_columns(columns: Optional[str]) -> list:
     if not columns:
         return [c for c in NAME_COLUMNS if c in _columns]
@@ -955,12 +1046,19 @@ def search(
     ),
     exact: bool = Query(False, description="If true, only whole-field matches (fast, uses indexes)."),
     page: int = Query(1, ge=1),
+    filters: dict = Depends(column_filters),
+    request: Request = None,
 ):
     """
     Searches plant names, best matches first: a whole-field match beats a
     starts-with match, which beats a contains match. 10 results per page.
+
+    Narrow it down with column filters, e.g.
+    `/search?q=tamarind&taxon_rank=Species&taxon_status=Accepted`.
     """
+    _reject_unknown_params(request, ("q", "columns", "exact", "page"))
     search_cols = _parse_name_columns(columns)
+    filter_sql, filter_params, applied = _filters_sql(filters)
     q = q.strip()
     starts, contains = f"{_escape_like(q)}%", f"%{_escape_like(q)}%"
 
@@ -974,6 +1072,9 @@ def search(
     # SQLite's multi-argument MIN is scalar; with one argument it's the aggregate.
     rank_sql = ranks[0] if len(ranks) == 1 else f"MIN({', '.join(ranks)})"
     rank_params = [q, starts, contains] * len(search_cols)
+    if filter_sql:
+        where_sql = f"({where_sql}) AND {filter_sql}"
+        where_params += filter_params
 
     conn = get_connection()
     try:
@@ -981,7 +1082,7 @@ def search(
     finally:
         conn.close()
 
-    return _page_response(rows, total, page, query=q, searched_columns=search_cols)
+    return _page_response(rows, total, page, query=q, searched_columns=search_cols, filters=applied)
 
 
 @app.get("/filter")
@@ -989,20 +1090,26 @@ def filter_exact(
     column: str = Query(..., description="One of genus, family, species, infraspecies, taxon_name"),
     value: str = Query(..., min_length=1, description="Exact value to match (case-insensitive)"),
     page: int = Query(1, ge=1),
+    filters: dict = Depends(column_filters),
+    request: Request = None,
 ):
     """
     Exact-match filter on one name column, e.g. /filter?column=family&value=Orchidaceae.
-    Accepted names first. 10 results per page.
+    Accepted names first. 10 results per page. Add column filters to narrow it,
+    e.g. `&taxon_rank=Genus`.
     """
+    _reject_unknown_params(request, ("column", "value", "page"))
     col = _parse_name_columns(column)
     if len(col) != 1:
         raise HTTPException(status_code=400, detail="Pass exactly one column.")
     col = col[0]
+    filter_sql, filter_params, applied = _filters_sql(filters)
+    where_sql = f'"{col}" = ? COLLATE NOCASE' + (f" AND {filter_sql}" if filter_sql else "")
 
     conn = get_connection()
     try:
-        rows, total = _fetch_page(conn, "0", [], f'"{col}" = ? COLLATE NOCASE', [value], page)
+        rows, total = _fetch_page(conn, "0", [], where_sql, [value] + filter_params, page)
     finally:
         conn.close()
 
-    return _page_response(rows, total, page, column=col, value=value)
+    return _page_response(rows, total, page, column=col, value=value, filters=applied)

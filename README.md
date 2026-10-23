@@ -79,6 +79,39 @@ many there are.
 `/filter` is an exact, case-insensitive match on one of those columns,
 accepted names first.
 
+#### Column filters
+
+Both endpoints also take column filters as plain query parameters:
+
+```
+GET /search?q=tamarind&taxon_rank=Species&taxon_status=Accepted
+GET /search?q=tamarind&taxon_status=Accepted&taxon_status=Synonym
+GET /search?q=rosa&lifeform_description=climber
+GET /filter?column=family&value=Fabaceae&taxon_rank=Genus
+```
+
+| Filter | Example values |
+|---|---|
+| `taxon_rank` | Species, Genus, Subspecies, Variety, Form |
+| `taxon_status` | Accepted, Synonym, Illegitimate, Unplaced, … |
+| `family` | Fabaceae |
+| `genus` | Tamarindus |
+| `lifeform_description` | tree, perennial, shrub or tree |
+| `climate_description` | wet tropical, temperate, subtropical, … |
+| `reviewed` | Y, N |
+
+- Matching is exact and case-insensitive.
+- Different filters combine with AND. Repeat a filter to allow several
+  values (OR), e.g. `taxon_status=Accepted&taxon_status=Synonym`.
+- Applied filters are echoed back in the response's `filters` field.
+- Mistakes are a 400 error instead of being ignored. An unknown parameter
+  (e.g. `taxon_rnk=`) lists the accepted ones. A value that doesn't exist
+  for `taxon_rank`, `taxon_status`, `climate_description` or `reviewed`
+  (e.g. `taxon_rank=Speicies`) lists the valid values.
+
+WCVP has scientific names only. `q=tamarind` works because it's part of
+*Tamarindus*, but a common name like "mango" won't find *Mangifera indica*.
+
 ### Distribution
 
 Search and filter results don't include distribution. Take the `ipni_id`
