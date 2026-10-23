@@ -32,6 +32,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -76,7 +78,7 @@ def _openapi_with_warnings() -> dict:
     return get_openapi(
         title=app.title,
         version=app.version,
-        description=monitoring.description_with_warnings(BASE_DESCRIPTION),
+        description=monitoring.description_with_warnings(BASE_DESCRIPTION, current_warnings()),
         routes=app.routes,
     )
 
@@ -536,6 +538,16 @@ def _load_db_state() -> None:
 
 # --- Startup / refresh orchestration ----------------------------------------
 
+# Warnings about building/updating the data. These can be raised by a separate
+# builder process (python -m app.build), so they're shared through
+# BUILD_STATUS_PATH instead of living only in one process's memory.
+BUILD_CODES = (
+    "zip_corrupt", "zip_member_missing", "csv_format_changed", "permission_denied",
+    "disk_full", "sqlite_error", "update_failed",
+    "source_unreachable", "source_not_found", "source_not_zip", "source_redirected",
+)
+
+
 def _record_failure(e: Exception, action: str) -> None:
     """Turns any failure while refreshing data into a warning with a clear reason."""
     note = _serving_note()
@@ -560,6 +572,39 @@ def _record_failure(e: Exception, action: str) -> None:
                         f"{str(e).rstrip('.')}.{note}", level=ERROR)
         # Unexpected, so keep the traceback; the known cases above explain themselves.
         logger.exception(f"{action} failed")
+
+
+def read_build_status() -> dict:
+    try:
+        with open(settings.build_status_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_build_status() -> None:
+    """Publishes this process's build warnings and last update check for /health."""
+    previous = read_build_status()
+    status = {
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "last_update_check": _last_update_check or previous.get("last_update_check"),
+        "warnings": [w for w in monitoring.active() if w["code"] in BUILD_CODES],
+    }
+    try:
+        os.makedirs(os.path.dirname(settings.build_status_path) or ".", exist_ok=True)
+        tmp = f"{settings.build_status_path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(status, f, indent=2)
+        os.replace(tmp, settings.build_status_path)
+    except OSError as e:
+        logger.warning(f"Couldn't write {settings.build_status_path}: {e}")
+
+
+def _latest_update_check() -> Optional[dict]:
+    """The most recent check, whether this process or a builder process ran it."""
+    checks = [c for c in (_last_update_check, read_build_status().get("last_update_check")) if c]
+    return max(checks, key=lambda c: c.get("checked_at", "")) if checks else None
 
 
 def _refresh_locked(force_download: bool = False, force_rebuild: bool = False) -> None:
@@ -591,63 +636,74 @@ def _refresh_locked(force_download: bool = False, force_rebuild: bool = False) -
     monitoring.clear(*REFRESH_CODES)
 
 
-def ensure_data_ready(force_download: bool = False, force_rebuild: bool = False) -> None:
+def ensure_data_ready(force_download: bool = False, force_rebuild: bool = False,
+                      action: str = "Preparing the data") -> None:
     """
-    Core readiness flow, shared by startup and /reload.
+    Core readiness flow, shared by startup, /reload and `python -m app.build`.
     - Downloads only if a CSV is missing or explicitly forced.
     - Rebuilds SQLite only if needed (missing DB, new download) or explicitly forced.
     A plain process restart with existing CSVs + existing DB does neither —
-    it just starts serving immediately.
+    it just starts serving immediately. Failures become warnings, published
+    with the rest of the build status.
     """
-    _require(sqlite3, "sqlite3")
-    _check_data_folder_writable()
-    with _build_lock, _process_lock:
-        _refresh_locked(force_download, force_rebuild)
+    try:
+        _require(sqlite3, "sqlite3")
+        _check_data_folder_writable()
+        with _build_lock, _process_lock:
+            _refresh_locked(force_download, force_rebuild)
+    except Exception as e:
+        _record_failure(e, action)
+        raise
+    finally:
+        write_build_status()
 
 
 def check_for_update() -> dict:
     """
     Compares Kew's current zip with the version we last downloaded and, only
     if it changed, downloads, extracts and rebuilds. The comparison happens
-    inside the locks, so when several workers check at once only the first
+    inside the locks, so when several processes check at once only the first
     one downloads — the others then see the version it saved.
     """
     global _last_update_check
     monitoring.check_environment(settings, sqlite3)
     checked_at = datetime.now(timezone.utc).isoformat()
     try:
-        remote = fetch_remote_version()
-        _check_data_folder_writable()
-    except Exception as e:
-        _record_failure(e, "Checking Kew for a new release")
-        _last_update_check = {"checked_at": checked_at, "error": str(e), "updated": False}
-        raise
-    monitoring.clear(*SOURCE_CODES)
+        try:
+            remote = fetch_remote_version()
+            _check_data_folder_writable()
+        except Exception as e:
+            _record_failure(e, "Checking Kew for a new release")
+            _last_update_check = {"checked_at": checked_at, "error": str(e), "updated": False}
+            raise
+        monitoring.clear(*SOURCE_CODES)
 
-    with _build_lock, _process_lock:
-        local = read_local_version()
-        updated = not _same_version(remote, local)
-        if updated:
-            logger.info(
-                f"New WCVP release (Last-Modified {remote['last_modified']}, "
-                f"had {local.get('last_modified') if local else 'unknown'}) - updating."
-            )
-            try:
-                _refresh_locked(force_download=True, force_rebuild=True)
-            except Exception as e:
-                _record_failure(e, "Updating to the new WCVP release")
-                _last_update_check = {
-                    "checked_at": checked_at, "remote": remote, "error": str(e), "updated": False,
-                }
-                raise
-        else:
-            logger.info(f"WCVP zip unchanged (Last-Modified {remote['last_modified']}).")
-    _last_update_check = {"checked_at": checked_at, "remote": remote, "updated": updated}
-    return _last_update_check
+        with _build_lock, _process_lock:
+            local = read_local_version()
+            updated = not _same_version(remote, local)
+            if updated:
+                logger.info(
+                    f"New WCVP release (Last-Modified {remote['last_modified']}, "
+                    f"had {local.get('last_modified') if local else 'unknown'}) - updating."
+                )
+                try:
+                    _refresh_locked(force_download=True, force_rebuild=True)
+                except Exception as e:
+                    _record_failure(e, "Updating to the new WCVP release")
+                    _last_update_check = {
+                        "checked_at": checked_at, "remote": remote, "error": str(e), "updated": False,
+                    }
+                    raise
+            else:
+                logger.info(f"WCVP zip unchanged (Last-Modified {remote['last_modified']}).")
+        _last_update_check = {"checked_at": checked_at, "remote": remote, "updated": updated}
+        return _last_update_check
+    finally:
+        write_build_status()
 
 
 def _update_loop() -> None:
-    """Checks once right after startup, then every UPDATE_CHECK_HOURS."""
+    """In-process mode: checks once right after startup, then every UPDATE_CHECK_HOURS."""
     while True:
         try:
             check_for_update()
@@ -660,17 +716,129 @@ def _update_loop() -> None:
 def _prepare_data() -> None:
     try:
         ensure_data_ready()
+    except Exception:
+        _load_db_state()  # already recorded; keep serving an older DB if there is one
+
+
+# --- Separate builder process (cPanel / LiteSpeed) ---------------------------
+#
+# LiteSpeed starts, stops and replaces web workers freely, and a worker's CPU is
+# capped, so a multi-minute download + build inside one gets cut off and starts
+# over. Instead, workers start `python -m app.build` as its own process, which
+# runs to completion regardless of what happens to them.
+
+_build_in_subprocess = False  # set by start_services(background=True)
+_SPAWN_MARKER = settings.db_path + ".spawned"
+
+
+def _python_executable() -> str:
+    """The virtualenv's python. Under lswsgi, sys.executable is the server
+    binary, not python, so look in the virtualenv first."""
+    for candidate in (
+        os.path.join(sys.prefix, "bin", "python"),
+        os.path.join(sys.prefix, "Scripts", "python.exe"),
+        sys.executable,
+    ):
+        if (candidate and os.path.exists(candidate)
+                and os.path.basename(candidate).lower().startswith("python")):
+            return candidate
+    return shutil.which("python3") or shutil.which("python") or "python3"
+
+
+def builder_running() -> bool:
+    """
+    Whether a build is in progress (in any process).
+
+    In builder mode the web workers never take the build lock themselves, so
+    "someone holds the lock" is exact, and the OS releases it the moment a
+    builder dies. In in-process mode this process may hold it (and probing a
+    lock you hold is unreliable), so fall back to the build's temp files
+    being recently written. Either way, a builder started in the last two
+    minutes counts, to cover its start-up before it takes the lock.
+    """
+    now = time.time()
+    try:
+        if now - os.path.getmtime(_SPAWN_MARKER) < 120:
+            return True
+    except OSError:
+        pass
+    if _build_in_subprocess and filelock is not None:
+        probe = filelock.FileLock(settings.db_path + ".lock", timeout=0)
+        try:
+            probe.acquire()
+            probe.release()
+            return False
+        except filelock.Timeout:
+            return True
+    working = (settings.db_path + ".building", settings.db_path + ".zip.tmp",
+               settings.csv_path + ".tmp", settings.distribution_csv_path + ".tmp")
+    for path in working:
+        try:
+            if now - os.path.getmtime(path) < 600:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def spawn_builder(mode: str = "ensure") -> bool:
+    """Starts `python -m app.build` in its own session. False if one is already running."""
+    if builder_running():
+        logger.info("A data build is already running; not starting another.")
+        return False
+    args = {"ensure": [], "check-update": ["--check-update"], "force": ["--force"]}[mode]
+    cmd = [_python_executable(), "-m", "app.build", *args]
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        os.makedirs(os.path.dirname(_SPAWN_MARKER) or ".", exist_ok=True)
+        with open(_SPAWN_MARKER, "w") as marker:
+            marker.write(" ".join(cmd))
+        log_dir = os.path.dirname(settings.log_path) or "."
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "build_output.log"), "ab") as out:
+            kwargs = dict(cwd=project_root, stdin=subprocess.DEVNULL, stdout=out,
+                          stderr=subprocess.STDOUT, close_fds=True)
+            if os.name == "posix":
+                kwargs["start_new_session"] = True  # own session: not killed with the worker
+                subprocess.Popen(cmd, **kwargs)
+            else:
+                flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                try:  # also leave the worker's job object, if it allows that
+                    subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+                except OSError:
+                    subprocess.Popen(cmd, creationflags=flags, **kwargs)
     except Exception as e:
-        _record_failure(e, "Preparing the data at startup")
-        _load_db_state()  # keep serving an older DB if there is one
-    if sqlite3 is None or not os.path.exists(settings.db_path):
         monitoring.warn(
-            "data_unavailable",
-            "No database is available, so search, filter and distribution return 503. "
-            "See the other warnings for why it couldn't be built.",
+            "builder_not_started",
+            f"Couldn't start the data builder ({' '.join(cmd)}): {e}. Run it by hand from the "
+            "app folder: python -m app.build",
             level=ERROR,
         )
+        return False
+    monitoring.clear("builder_not_started")
+    logger.info(f"Started data builder: {' '.join(cmd)}")
+    return True
 
+
+def _subprocess_update_loop() -> None:
+    """
+    Builder mode: starts a check when the last one (by any process) is older
+    than UPDATE_CHECK_HOURS. Every worker runs this; the shared status file
+    and the spawn marker keep it to about one check per interval.
+    """
+    while True:
+        last = (_latest_update_check() or {}).get("checked_at")
+        try:
+            age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600
+        except (TypeError, ValueError):
+            age_hours = None
+        if age_hours is None or age_hours >= settings.update_check_hours:
+            spawn_builder("check-update")
+        if _stop_updates.wait(min(3600, settings.update_check_hours * 3600)):
+            return
+
+
+# --- Startup ----------------------------------------------------------------
 
 _started_pid: Optional[int] = None  # a pid, not a flag: a forked child must start its own
 _start_lock = threading.Lock()
@@ -681,14 +849,15 @@ def start_services(background: bool = False) -> None:
     Startup work: environment checks, data prep, and the daily update check.
     Runs once per process, however often it's called.
 
-    - Under uvicorn/gunicorn it runs from the startup event and prepares the
-      data before serving (background=False).
-    - Under cPanel/Passenger (passenger_wsgi.py) there are no startup events,
-      and Passenger gives up on an app that takes minutes to start, so the
-      data prep runs in a background thread (background=True). Until the
-      first build finishes, queries return 503 and /health says it's preparing.
+    - Under uvicorn/gunicorn it runs from the startup event, prepares the data
+      before serving, and checks for updates in a thread (background=False).
+    - Under cPanel (passenger_wsgi.py, Passenger or LiteSpeed) web workers
+      can't be trusted with a multi-minute build, so building and update
+      checks run in a separate builder process (background=True). Until the
+      first build finishes, queries return 503 and /health says it's preparing;
+      the new database is picked up without a restart.
     """
-    global _started_pid
+    global _started_pid, _build_in_subprocess
     with _start_lock:
         if _started_pid == os.getpid():
             return
@@ -703,27 +872,15 @@ def start_services(background: bool = False) -> None:
             threading.Thread(target=_update_loop, name="wcvp-update-check", daemon=True).start()
         return
 
-    # Reading the column list from an existing DB takes milliseconds; do it now,
-    # or the first requests would see no columns while the thread starts up.
+    _build_in_subprocess = True
     try:
-        _load_db_state()
+        _sync_db_state()
     except Exception as e:
         _record_failure(e, "Reading the existing database")
-
-    def prepare_then_watch():
-        if not os.path.exists(settings.db_path):
-            monitoring.warn(
-                "data_preparing",
-                "Downloading wcvp.zip and building the database in the background. The "
-                "first start takes a few minutes; queries return 503 until it's done.",
-                level=INFO,
-            )
-        _prepare_data()
-        monitoring.clear("data_preparing")
-        if run_updates:
-            _update_loop()
-
-    threading.Thread(target=prepare_then_watch, name="wcvp-startup", daemon=True).start()
+    if not os.path.exists(settings.db_path) or not db_has_distribution():
+        spawn_builder("ensure")
+    if run_updates:
+        threading.Thread(target=_subprocess_update_loop, name="wcvp-update-check", daemon=True).start()
 
 
 @app.on_event("startup")
@@ -736,11 +893,56 @@ def shutdown_event():
     _stop_updates.set()
 
 
+_db_mtime: Optional[int] = None
+
+
+def _sync_db_state() -> None:
+    """Reloads columns/flags when the DB file changed, e.g. after a builder
+    process swapped in a new one — so no restart is needed."""
+    global _db_mtime
+    try:
+        mtime = os.stat(settings.db_path).st_mtime_ns
+    except OSError:
+        return
+    if mtime != _db_mtime:
+        _load_db_state()
+        _db_mtime = mtime
+
+
+def current_warnings() -> list:
+    """
+    What /health and the Swagger banner show: this process's own warnings,
+    build warnings from the shared status file (the builder may be another
+    process), and whether data is available right now.
+    """
+    live = ("data_unavailable", "data_preparing")
+    items = [w for w in monitoring.active() if w["code"] not in BUILD_CODES + live]
+    items += read_build_status().get("warnings") or []
+    if sqlite3 is None or not os.path.exists(settings.db_path):
+        now = datetime.now(timezone.utc).isoformat()
+        if builder_running():
+            items.append({
+                "code": "data_preparing", "level": INFO, "detail": None, "since": now,
+                "message": "Downloading wcvp.zip and building the database. This takes a few "
+                           "minutes; queries return 503 until it's done.",
+            })
+        else:
+            items.append({
+                "code": "data_unavailable", "level": ERROR, "detail": None, "since": now,
+                "message": "No database is available, so search, filter and distribution "
+                           "return 503. See the other warnings for why it couldn't be built, "
+                           "or run `python -m app.build` in the app folder.",
+            })
+    order = {ERROR: 0, WARNING: 1, INFO: 2}
+    return sorted(items, key=lambda w: (order.get(w["level"], 3), w.get("since", "")))
+
+
 def get_connection() -> sqlite3.Connection:
     if sqlite3 is None:
         raise HTTPException(status_code=503, detail="SQLite is not available on this server. See /health.")
     if not os.path.exists(settings.db_path):
         raise HTTPException(status_code=503, detail="Database not ready yet. See /health.")
+    _sync_db_state()
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
     return conn
@@ -960,7 +1162,7 @@ def health():
             monitoring.warn("database_unreadable", f"The database at {settings.db_path} can't be "
                             f"queried: {e}", level=ERROR)
 
-    warnings = monitoring.active()
+    warnings = current_warnings()
     if not db_available:
         status = "unavailable"
     elif any(w["level"] in (ERROR, WARNING) for w in warnings):
@@ -974,7 +1176,8 @@ def health():
         "distribution_loaded": _has_distribution,
         "ready_at": _last_ready_at.isoformat() if _last_ready_at else None,
         "data_version": (read_local_version() or {}).get("last_modified"),
-        "last_update_check": _last_update_check,
+        "last_update_check": _latest_update_check(),
+        "build_mode": "separate process" if _build_in_subprocess else "in-process",
         "log_file": os.path.abspath(settings.log_path),
         "warnings": warnings,
     }
@@ -996,13 +1199,24 @@ def source():
         "loaded_version": read_local_version(),
         "update_check_enabled": settings.update_check_enabled,
         "update_check_hours": settings.update_check_hours,
-        "last_check": _last_update_check,
+        "last_check": _latest_update_check(),
     }
 
 
 def _require_reload_token(x_reload_token: Optional[str]) -> None:
     if settings.reload_token and x_reload_token != settings.reload_token:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Reload-Token header.")
+
+
+def _started_response(started: bool, what: str) -> JSONResponse:
+    """Builder mode: the work runs in a separate process, so answer right away."""
+    if started:
+        body = {"status": "started", "detail": f"{what} in a separate process. "
+                "Follow it on /health and /source; the result appears there when it's done."}
+    else:
+        body = {"status": "already_running", "detail": "A data build is already running. "
+                "Follow it on /health and /source."}
+    return JSONResponse(body, status_code=202)
 
 
 @app.post("/check-update")
@@ -1012,6 +1226,8 @@ def check_update(x_reload_token: Optional[str] = Header(None)):
     published a newer wcvp.zip than the one loaded.
     """
     _require_reload_token(x_reload_token)
+    if _build_in_subprocess:
+        return _started_response(spawn_builder("check-update"), "Checking Kew for a new release")
     try:
         return check_for_update()
     except Exception as e:
@@ -1026,11 +1242,12 @@ def reload_data(x_reload_token: Optional[str] = Header(None)):
     the "force" trigger. Use /check-update to download only when newer.
     """
     _require_reload_token(x_reload_token)
+    if _build_in_subprocess:
+        return _started_response(spawn_builder("force"), "Re-downloading and rebuilding the data")
     monitoring.check_environment(settings, sqlite3)
     try:
-        ensure_data_ready(force_download=True, force_rebuild=True)
+        ensure_data_ready(force_download=True, force_rebuild=True, action="Reload")
     except Exception as e:
-        _record_failure(e, "Reload")
         raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
 
     return {"status": "reloaded", "ready_at": _last_ready_at.isoformat()}

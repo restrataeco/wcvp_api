@@ -113,9 +113,9 @@ def active() -> list:
         return sorted(_warnings.values(), key=lambda w: (order[w["level"]], w["since"]))
 
 
-def description_with_warnings(base: str) -> str:
+def description_with_warnings(base: str, items: Optional[list] = None) -> str:
     """Swagger page description, with a banner listing active warnings."""
-    items = active()
+    items = active() if items is None else items
     if not items:
         return base
     lines = [f"## ⚠️ {len(items)} active warning{'s' if len(items) > 1 else ''}", ""]
