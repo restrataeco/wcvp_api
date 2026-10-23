@@ -1,12 +1,20 @@
 """
-Entry point for cPanel "Setup Python App" (Phusion Passenger).
+Entry point for cPanel "Setup Python App" (Passenger or LiteSpeed's lswsgi).
 
-Passenger speaks WSGI, and FastAPI is an ASGI app, so a2wsgi wraps it.
-a2wsgi doesn't run FastAPI's startup events, so the startup work is started
-here instead — in the background, because Passenger gives up on an app that
-takes minutes to start, and the first start downloads and builds the data.
+Both speak WSGI, and FastAPI is an ASGI app, so a2wsgi wraps it. Two things
+make this file more than a one-liner:
 
-If the app can't even be imported (e.g. requirements not installed), every
+- Fork safety. LiteSpeed loads this file once and then forks worker
+  processes from it. Threads don't survive a fork, and a2wsgi runs its event
+  loop in a thread, so if the wrapper were created here at import time,
+  every request in a worker would wait forever on a loop that isn't running.
+  The wrapper and the startup work (update check, data prep) are therefore
+  created on the first request in each process.
+- Startup work. a2wsgi doesn't run FastAPI's startup events, so
+  start_services() is called here, in the background, because the host gives
+  up on an app that takes minutes to answer.
+
+If the app can't be imported (e.g. requirements not installed), every
 request gets a plain-text page saying why instead of the host's generic 500,
 and the full traceback goes to startup_error.log in this folder.
 
@@ -16,6 +24,7 @@ In cPanel: Application startup file = passenger_wsgi.py,
 
 import os
 import sys
+import threading
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_ROOT)
@@ -26,8 +35,18 @@ try:
 
     from app.main import app, start_services
 
-    start_services(background=True)
-    application = ASGIMiddleware(app)
+    _wrapped = {"pid": None, "app": None}
+    _init_lock = threading.Lock()
+
+    def application(environ, start_response):
+        # Set up once per process — after any fork, never in the parent.
+        if _wrapped["pid"] != os.getpid():
+            with _init_lock:
+                if _wrapped["pid"] != os.getpid():
+                    _wrapped["app"] = ASGIMiddleware(app)
+                    start_services(background=True)
+                    _wrapped["pid"] = os.getpid()
+        return _wrapped["app"](environ, start_response)
 
 except Exception:
     import traceback
